@@ -1,0 +1,204 @@
+import { useEffect, useMemo, useState } from 'react'
+import { supabase } from '../lib/supabase'
+import { JOURS, MOIS, addDays, diffDays, fmt, hhmm, parse, today, wdOf } from '../lib/dates'
+import { ONB_STEPS, whoName } from '../lib/method'
+import { Empty, Pill, TypeTag, statusOf } from '../components/ui'
+
+export default function Today({ box, role, data, reload, log, toast, myCoach, me, goTo }) {
+  const t = today()
+  const [D, setD] = useState(t)
+  const past = D < t
+  const wd = wdOf(D)
+  const isMine = (who) => role === 'owner' || who === myCoach || who === 'equipe'
+
+  const items = useMemo(() => {
+    const out = []
+    const evName = Object.fromEntries(data.events.map((e) => [e.id, e.name]))
+    data.event_tasks.filter((k) => !k.done && isMine(k.assignee)).forEach((k) => out.push({ kind: 'task', id: k.id, due: k.due, title: k.title, detail: (evName[k.event_id] || 'Événement') + ' · ' + whoName(k.assignee, data.coaches) }))
+    data.actions.filter((a) => !a.done && isMine(a.assignee)).forEach((a) => out.push({ kind: 'action', id: a.id, due: a.due, title: a.title, detail: 'Action de réunion · ' + whoName(a.assignee, data.coaches) }))
+    data.reminders.filter((r) => !r.done).forEach((r) => out.push({ kind: 'reminder', id: r.id, due: r.due, title: r.title, detail: 'Rappel' }))
+    data.onboarding.forEach((o) => ONB_STEPS.forEach(([k, off, ti, de]) => {
+      if (o.steps && o.steps[k]) return
+      const due = addDays(o.start_day, off)
+      if (diffDays(t, o.start_day) <= 75) out.push({ kind: 'onb', id: o.id, step: k, due, title: o.member_name + ' · ' + ti, detail: 'Suivi 60 jours · ' + de })
+    }))
+    data.trials.filter((e) => e.result === 'att').forEach((e) => out.push({ kind: 'trial', id: e.id, due: addDays(e.day, 3), title: 'Relancer ' + (e.prospect || 'le prospect') + ' après son essai', detail: 'Essai du ' + fmt(e.day) + ' · ' + whoName(e.coach_id, data.coaches) }))
+    return out.sort((a, b) => a.due.localeCompare(b.due))
+  }, [data, role, myCoach]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const todo = past ? items.filter((i) => i.due === D) : items.filter((i) => i.due <= D)
+  const done = data.journal.filter((j) => j.day === D)
+  const courses = data.courses.filter((c) => c.weekday === wd)
+  const att = Object.fromEntries(data.attendance.filter((a) => a.day === D).map((a) => [a.course_id, a.present]))
+  const [pres, setPres] = useState({})
+  useEffect(() => setPres({}), [D])
+  const trialsDay = data.trials.filter((e) => e.day === D)
+  const evs = data.events.filter((e) => e.day >= D && e.day <= addDays(D, 45))
+
+  async function finish(i) {
+    let error
+    if (i.kind === 'task') ({ error } = await supabase.from('event_tasks').update({ done: true, done_at: new Date().toISOString() }).eq('id', i.id))
+    if (i.kind === 'action') ({ error } = await supabase.from('actions').update({ done: true, done_at: new Date().toISOString() }).eq('id', i.id))
+    if (i.kind === 'reminder') ({ error } = await supabase.from('reminders').update({ done: true }).eq('id', i.id))
+    if (i.kind === 'trial') ({ error } = await supabase.from('trials').update({ result: 'oui' }).eq('id', i.id))
+    if (i.kind === 'onb') {
+      const o = data.onboarding.find((x) => x.id === i.id)
+      ;({ error } = await supabase.from('onboarding').update({ steps: { ...(o.steps || {}), [i.step]: t } }).eq('id', i.id))
+    }
+    if (error) return toast(error.message)
+    await log('Fait : ' + i.title)
+    toast('C\'est noté')
+    reload()
+  }
+
+  async function saveAttendance(e) {
+    e.preventDefault()
+    const rows = courses.filter((c) => pres[c.id] !== undefined && pres[c.id] !== '').map((c) => ({ course_id: c.id, box_id: box.id, day: D, present: Math.max(0, Number(pres[c.id]) || 0) }))
+    if (!rows.length) return toast('Saisis au moins un cours')
+    const { error } = await supabase.from('attendance').upsert(rows)
+    if (error) return toast(error.message)
+    await log('Fréquentation saisie du ' + fmt(D) + ' (' + rows.length + ' cours)')
+    setPres({})
+    toast('Fréquentation enregistrée')
+    reload()
+  }
+
+  const [prospect, setProspect] = useState('')
+  const [tCoach, setTCoach] = useState('')
+  async function addTrial(e) {
+    e.preventDefault()
+    const coach_id = role === 'owner' ? (tCoach || (data.coaches[0] && data.coaches[0].id)) : myCoach
+    if (!coach_id) return toast('Ajoute d\'abord un coach dans Équipe')
+    const { error } = await supabase.from('trials').insert({ box_id: box.id, day: D, prospect: prospect.trim(), coach_id, result: 'att' })
+    if (error) return toast(error.message)
+    await log('Essai ajouté : ' + (prospect.trim() || 'prospect') + ' avec ' + whoName(coach_id, data.coaches))
+    setProspect('')
+    reload()
+  }
+  async function setResult(id, result) {
+    const { error } = await supabase.from('trials').update({ result }).eq('id', id)
+    if (error) return toast(error.message)
+    reload()
+  }
+
+  const [rTitle, setRTitle] = useState('')
+  async function addReminder(e) {
+    e.preventDefault()
+    const { error } = await supabase.from('reminders').insert({ box_id: box.id, title: rTitle.trim(), due: D > t ? D : addDays(t, 1) })
+    if (error) return toast(error.message)
+    setRTitle('')
+    reload()
+  }
+
+  const dayLbl = JOURS[wd] + ' ' + parse(D).getDate() + ' ' + MOIS[parse(D).getMonth()] + ' ' + parse(D).getFullYear()
+  return (
+    <div className="stack">
+      <div className="card daynav">
+        <div className="spread">
+          <div className="row">
+            <button className="btn small ghost" onClick={() => setD(addDays(D, -1))}>← Veille</button>
+            <input type="date" value={D} onChange={(e) => e.target.value && setD(e.target.value)} aria-label="Jour" />
+            <button className={'btn small' + (D === t ? '' : ' ghost')} onClick={() => setD(t)}>Aujourd'hui</button>
+            <button className="btn small ghost" onClick={() => setD(addDays(D, 1))}>Lendemain →</button>
+          </div>
+          <h2 className="dayttl">{dayLbl} {D === t ? <Pill>Aujourd'hui</Pill> : past ? <Pill cls="warn">Jour passé</Pill> : <Pill cls="good">À venir</Pill>}</h2>
+        </div>
+      </div>
+      {role === 'coach' && !me && <p className="notice">Ton compte n'est pas encore relié à une fiche coach. Demande à l'owner de t'inviter depuis sa fiche.</p>}
+
+      <div className="grid g2 top">
+        <div className="card">
+          <div className="spread"><h2>{past ? 'Resté à faire ce jour-là' : 'À faire'}</h2><Pill cls={todo.some((i) => i.due < t) ? 'bad' : 'neutral'}>{todo.length}</Pill></div>
+          <div className="list">
+            {todo.map((i) => {
+              const st = statusOf(i.due, t)
+              return (
+                <div className="item" key={i.kind + i.id + (i.step || '')}>
+                  <span className={'stripe ' + st.cls} />
+                  <div>
+                    <div className="t">{i.title}</div>
+                    <div className="m">{i.detail} · échéance {fmt(i.due)}</div>
+                    <div className="acts"><Pill cls={st.cls}>{st.txt}</Pill><button className="btn small" onClick={() => finish(i)}>{i.kind === 'trial' ? 'Inscrit' : 'Fait'}</button></div>
+                  </div>
+                </div>
+              )
+            })}
+            {!todo.length && <Empty>{past ? "Rien n'était en attente ce jour-là." : 'Rien à faire. Bonne séance !'}</Empty>}
+          </div>
+          {role === 'owner' && !past && (
+            <form className="row sep" onSubmit={addReminder}>
+              <input value={rTitle} onChange={(e) => setRTitle(e.target.value)} placeholder="Ajouter un rappel" required style={{ flex: 1 }} aria-label="Nouveau rappel" />
+              <button className="btn small">Ajouter</button>
+            </form>
+          )}
+        </div>
+
+        <div className="stack">
+          <div className="card">
+            <div className="spread"><h2>Cours du jour</h2><span className="sub">{courses.length} cours</span></div>
+            {!courses.length && <Empty>Pas de cours ce jour-là.</Empty>}
+            {role === 'owner' && courses.length > 0 ? (
+              <form onSubmit={saveAttendance}>
+                <div className="list">
+                  {courses.map((c) => (
+                    <div className="prow" key={c.id}>
+                      <TypeTag name={c.type_name} types={data.course_types} /><b className="num">{hhmm(c.start_time)}</b>
+                      {att[c.id] !== undefined && <Pill cls={att[c.id] / c.capacity >= 0.9 ? 'warn' : att[c.id] / c.capacity >= 0.6 ? 'good' : 'bad'}>{Math.round(att[c.id] / c.capacity * 100)} %</Pill>}
+                      <label className="inline right">Présents <input type="number" min="0" style={{ width: 70 }} value={pres[c.id] ?? att[c.id] ?? ''} onChange={(e) => setPres({ ...pres, [c.id]: e.target.value })} /> / {c.capacity}</label>
+                    </div>
+                  ))}
+                </div>
+                {D <= t ? <div className="row end"><button className="btn small">Enregistrer la fréquentation</button></div> : <p className="sub">La fréquentation se saisit le jour même ou après.</p>}
+              </form>
+            ) : (
+              <div className="list">{courses.map((c) => <div className="prow" key={c.id}><TypeTag name={c.type_name} types={data.course_types} /><b className="num">{hhmm(c.start_time)}</b><span className="sub right">{c.capacity} places</span></div>)}</div>
+            )}
+          </div>
+
+          <div className="card">
+            <div className="spread"><h2>Séances d'essai</h2><span className="sub">{trialsDay.length} ce jour-là</span></div>
+            <div className="list">
+              {trialsDay.map((e) => (
+                <div className="prow" key={e.id}>
+                  <div><b>{e.prospect || 'Prospect'}</b><div className="sub">avec {whoName(e.coach_id, data.coaches)}</div></div>
+                  <div className="seg right">
+                    {[['att', 'En attente'], ['oui', 'Inscrit'], ['non', 'Pas inscrit']].map(([k, l]) => <button key={k} className={'r' + k} aria-pressed={e.result === k} onClick={() => setResult(e.id, k)}>{l}</button>)}
+                  </div>
+                </div>
+              ))}
+              {!trialsDay.length && <Empty>Aucun essai noté.</Empty>}
+            </div>
+            {D <= t && (
+              <form className="row" onSubmit={addTrial}>
+                <input value={prospect} onChange={(e) => setProspect(e.target.value)} placeholder="Prénom du prospect" style={{ flex: 1, minWidth: 140 }} aria-label="Prénom du prospect" />
+                {role === 'owner' && <select value={tCoach} onChange={(e) => setTCoach(e.target.value)} aria-label="Coach">{data.coaches.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}</select>}
+                <button className="btn small">Ajouter</button>
+              </form>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="grid g2 top">
+        <div className="card">
+          <h2>Fait ce jour-là</h2>
+          <div className="list">
+            {done.map((j) => <div className="item" key={j.id}><span className="stripe good" /><div><div className="t">{j.text}</div></div></div>)}
+            {!done.length && <Empty>Rien d'enregistré ce jour-là.</Empty>}
+          </div>
+        </div>
+        <div className="card">
+          <div className="spread"><h2>Événements à venir</h2><button className="btn small ghost" onClick={() => goTo('events')}>Tous les événements</button></div>
+          <div className="list">
+            {evs.map((e) => {
+              const ks = data.event_tasks.filter((k) => k.event_id === e.id && !k.done)
+              const late = ks.filter((k) => k.due < t).length
+              return <div className="item" key={e.id}><span className={'stripe ' + (late ? 'bad' : 'good')} /><div><div className="t">{e.name}</div><div className="m">{fmt(e.day)} · J-{diffDays(e.day, D)} · {ks.length} tâche(s) ouverte(s){late ? ' dont ' + late + ' en retard' : ''}</div></div></div>
+            })}
+            {!evs.length && <Empty>Aucun événement dans les 45 jours.</Empty>}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}

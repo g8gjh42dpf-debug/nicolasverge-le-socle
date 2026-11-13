@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#1E3A3F"/>
+  <circle cx="400" cy="120" r="90" fill="#93A8A6"/>
+  <circle cx="96" cy="430" r="110" fill="#D8B9A0"/>
+  <text x="256" y="300" text-anchor="middle" font-family="Arial Narrow, Arial, sans-serif" font-weight="700" font-size="150" fill="#FFFFFF" letter-spacing="6">SOCLE</text>
+</svg>
